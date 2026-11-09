@@ -46,7 +46,6 @@ const PAIR_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_INTERVAL: Duration = Duration::from_secs(2);
-const CONNECT_RETRY: Duration = Duration::from_secs(5);
 const CONNECT_DISCOVERY: Duration = Duration::from_secs(8);
 
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(240);
@@ -423,9 +422,13 @@ fn ready_device(adb: &Adb) -> Option<String> {
 
 /// adb 34 refuses bare mDNS instance names ("Invalid port while parsing address"),
 /// so resolve the advertised service to `ip:port` before talking to adb.
-fn mdns_addr(adb: &Adb, service_type: &str, prefer_instance: &str) -> Option<String> {
-    let text = adb.run_raw(&["mdns", "services"])?;
-    let mut fallback = None;
+fn mdns_addrs(adb: &Adb, service_type: &str, prefer_instance: &str) -> Vec<String> {
+    let text = match adb.run_raw(&["mdns", "services"]) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let mut preferred = Vec::new();
+    let mut others = Vec::new();
     for line in text.lines() {
         if !line.contains(service_type) {
             continue;
@@ -436,14 +439,21 @@ fn mdns_addr(adb: &Adb, service_type: &str, prefer_instance: &str) -> Option<Str
             Some(a) => a,
             None => continue,
         };
+        let addr = addr.to_string();
         if !prefer_instance.is_empty() && instance == prefer_instance {
-            return Some(addr.to_string());
-        }
-        if fallback.is_none() {
-            fallback = Some(addr.to_string());
+            if !preferred.contains(&addr) {
+                preferred.push(addr);
+            }
+        } else if !others.contains(&addr) && !preferred.contains(&addr) {
+            others.push(addr);
         }
     }
-    fallback
+    preferred.extend(others);
+    preferred
+}
+
+fn mdns_addr(adb: &Adb, service_type: &str, prefer_instance: &str) -> Option<String> {
+    mdns_addrs(adb, service_type, prefer_instance).into_iter().next()
 }
 
 fn looks_like_addr(token: &str) -> bool {
@@ -554,14 +564,13 @@ fn pair_loop(adb: &Adb, code: &str, stop: &AtomicBool, tx: &mpsc::Sender<Event>)
                 if out.contains("Successfully paired") {
                     log(tx, "[配对] 配对成功，正在建立连接…");
                     let _ = tx.send(Event::Status("配对成功，正在连接设备…".to_string()));
-                    match connect_endpoint(adb, &out, stop) {
-                        Some(addr) => {
-                            if let Some(target) = connect(adb, &addr, stop, tx) {
-                                return Some(target);
-                            }
-                            log(tx, "[配对] 连接未确认，重试");
-                        }
-                        None => log(tx, "[配对] 未找到连接端点，重试"),
+                    let endpoints = connect_endpoints(adb, &out, stop);
+                    if endpoints.is_empty() {
+                        log(tx, "[配对] 未找到连接端点，重试");
+                    } else if let Some(target) = connect(adb, &endpoints, stop, tx) {
+                        return Some(target);
+                    } else {
+                        log(tx, "[配对] 连接未确认，重试");
                     }
                 }
             }
@@ -582,22 +591,24 @@ fn pair_loop(adb: &Adb, code: &str, stop: &AtomicBool, tx: &mpsc::Sender<Event>)
     None
 }
 
-/// After pairing the phone advertises `_adb-tls-connect._tcp`; prefer that
-/// address, fall back to the guid printed by `adb pair`.
-fn connect_endpoint(adb: &Adb, pair_out: &str, stop: &AtomicBool) -> Option<String> {
+/// After pairing the phone advertises `_adb-tls-connect._tcp`. Collect every
+/// advertised address (multiple NICs may each broadcast one) and let `connect`
+/// try them one by one; fall back to the guid printed by `adb pair`.
+fn connect_endpoints(adb: &Adb, pair_out: &str, stop: &AtomicBool) -> Vec<String> {
     let deadline = Instant::now() + CONNECT_DISCOVERY;
     loop {
-        if let Some(addr) = mdns_addr(adb, CONNECT_SERVICE, "") {
-            return Some(addr);
+        let addrs = mdns_addrs(adb, CONNECT_SERVICE, "");
+        if !addrs.is_empty() {
+            return addrs;
         }
         if Instant::now() >= deadline || stop.load(Ordering::SeqCst) {
             break;
         }
         if !sleep_interruptible(Duration::from_secs(1), stop) {
-            return None;
+            return Vec::new();
         }
     }
-    parse_guid(pair_out)
+    parse_guid(pair_out).into_iter().collect()
 }
 
 fn parse_guid(out: &str) -> Option<String> {
@@ -614,33 +625,46 @@ fn parse_guid(out: &str) -> Option<String> {
     }
 }
 
-fn connect(adb: &Adb, addr: &str, stop: &AtomicBool, tx: &mpsc::Sender<Event>) -> Option<String> {
+/// Try each candidate endpoint until one shows up as a ready device.
+/// With several NICs the phone may advertise a stale/unreachable address on one
+/// of them, so a single failure must not abort the whole pairing.
+fn connect(adb: &Adb, addrs: &[String], stop: &AtomicBool, tx: &mpsc::Sender<Event>) -> Option<String> {
     let before: HashSet<String> = list_devices(adb).into_iter().map(|d| d.serial).collect();
     let deadline = Instant::now() + CONNECT_TIMEOUT;
-    let mut next_connect = Instant::now();
+
+    // pre-connect every candidate once up front so all are in flight, then poll
+    for addr in addrs {
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        log(tx, &format!("[连接] adb connect {addr}"));
+        if let Some(out) = adb.run_raw(&["connect", addr]) {
+            for line in out.lines() {
+                if !line.trim().is_empty() {
+                    log(tx, &format!("   {line}"));
+                }
+            }
+        }
+    }
 
     loop {
         if stop.load(Ordering::SeqCst) {
             return None;
         }
 
-        if Instant::now() >= next_connect {
-            log(tx, &format!("[连接] adb connect {addr}"));
-            if let Some(out) = adb.run_raw(&["connect", addr]) {
-                for line in out.lines() {
-                    if !line.trim().is_empty() {
-                        log(tx, &format!("   {line}"));
-                    }
-                }
-            }
-            next_connect = Instant::now() + CONNECT_RETRY;
-        }
-
         let devices = list_devices(adb);
-        if let Some(serial) = pick_connected(&devices, addr, &before) {
+        for addr in addrs {
+            if let Some(serial) = pick_connected(&devices, addr, &before) {
+                log(tx, &format!("[连接] 设备就绪：{serial}"));
+                return Some(serial);
+            }
+        }
+        // any fresh device regardless of address also counts
+        if let Some(serial) = pick_connected(&devices, "", &before) {
             log(tx, &format!("[连接] 设备就绪：{serial}"));
             return Some(serial);
         }
+
         if Instant::now() >= deadline {
             log(tx, "[连接] 设备未在限定时间内就绪");
             return None;
