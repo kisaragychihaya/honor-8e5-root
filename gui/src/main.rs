@@ -554,6 +554,7 @@ fn pair_loop(adb: &Adb, code: &str, stop: &AtomicBool, tx: &mpsc::Sender<Event>)
 
         let mut paired = false;
         let mut pair_out = String::new();
+        let mut paired_host = String::new();
         for host in &hosts {
             if stop.load(Ordering::SeqCst) {
                 return None;
@@ -572,6 +573,7 @@ fn pair_loop(adb: &Adb, code: &str, stop: &AtomicBool, tx: &mpsc::Sender<Event>)
                     if out.contains("Successfully paired") {
                         paired = true;
                         pair_out = out;
+                        paired_host = host.clone();
                         break;
                     }
                 }
@@ -593,7 +595,7 @@ fn pair_loop(adb: &Adb, code: &str, stop: &AtomicBool, tx: &mpsc::Sender<Event>)
 
         log(tx, "[配对] 配对成功，正在建立连接…");
         let _ = tx.send(Event::Status("配对成功，正在连接设备…".to_string()));
-        let endpoints = connect_endpoints(adb, &pair_out, stop);
+        let endpoints = connect_endpoints(adb, &pair_out, &paired_host, stop);
         if endpoints.is_empty() {
             log(tx, "[配对] 未找到连接端点，重试");
         } else if let Some(target) = connect(adb, &endpoints, stop, tx) {
@@ -611,24 +613,110 @@ fn pair_loop(adb: &Adb, code: &str, stop: &AtomicBool, tx: &mpsc::Sender<Event>)
     None
 }
 
-/// After pairing the phone advertises `_adb-tls-connect._tcp`. Collect every
-/// advertised address (multiple NICs may each broadcast one) and let `connect`
-/// try them one by one; fall back to the guid printed by `adb pair`.
-fn connect_endpoints(adb: &Adb, pair_out: &str, stop: &AtomicBool) -> Vec<String> {
+/// Split "host:port" into (host, port). Handles IPv4 and bracket-less hosts.
+fn split_host_port(s: &str) -> Option<(String, u16)> {
+    let (host, port) = s.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some((host.to_string(), port))
+    }
+}
+
+/// Scan `ip` for open TCP ports in `range`, concurrently. Returns open ports
+/// sorted by distance from `near` (the pairing port) so the connect port, which
+/// stays open right after pairing, is tried first.
+fn scan_open_ports(ip: &str, range: std::ops::Range<u32>, near: u32, stop: &AtomicBool) -> Vec<u16> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+    use std::sync::{Arc, Mutex};
+
+    let open: Arc<Mutex<Vec<u16>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut handles = Vec::new();
+    let concurrency = 128;
+    let next = Arc::new(AtomicUsize::new(range.start as usize));
+    let stop = Arc::new(AtomicBool::new(stop.load(Ordering::SeqCst)));
+    let end = range.end as usize;
+
+    for _ in 0..concurrency {
+        let open = Arc::clone(&open);
+        let next = Arc::clone(&next);
+        let stop = Arc::clone(&stop);
+        let ip = ip.to_string();
+        handles.push(thread::spawn(move || loop {
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let i = next.fetch_add(1, AOrd::SeqCst);
+            if i >= end {
+                return;
+            }
+            let port = i as u16;
+            let addr = format!("{ip}:{port}");
+            if let Ok(mut it) = addr.to_socket_addrs() {
+                if let Some(sa) = it.next() {
+                    if TcpStream::connect_timeout(&sa, Duration::from_millis(250)).is_ok() {
+                        open.lock().unwrap().push(port);
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+
+    let mut ports = open.lock().unwrap().clone();
+    ports.sort_by_key(|p| p.abs_diff(near as u16));
+    ports
+}
+
+/// After pairing the phone advertises `_adb-tls-connect._tcp`. mDNS discovery
+/// is unreliable on some networks (e.g. phone hotspots), so in addition to any
+/// advertised addresses we scan the paired IP for the long-lived connect port:
+/// the ephemeral pairing port closes right after pairing while the connect port
+/// stays open, so open ports near the pairing port are strong candidates.
+fn connect_endpoints(adb: &Adb, pair_out: &str, pair_host: &str, stop: &AtomicBool) -> Vec<String> {
+    let mut endpoints: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let push = |e: String, endpoints: &mut Vec<String>, seen: &mut HashSet<String>| {
+        if seen.insert(e.clone()) {
+            endpoints.push(e);
+        }
+    };
+
+    // 1) advertised addresses from mDNS (if any)
     let deadline = Instant::now() + CONNECT_DISCOVERY;
     loop {
         let addrs = mdns_addrs(adb, CONNECT_SERVICE, "");
-        if !addrs.is_empty() {
-            return addrs;
+        for a in addrs {
+            push(a, &mut endpoints, &mut seen);
         }
-        if Instant::now() >= deadline || stop.load(Ordering::SeqCst) {
+        if !endpoints.is_empty() || Instant::now() >= deadline || stop.load(Ordering::SeqCst) {
             break;
         }
         if !sleep_interruptible(Duration::from_secs(1), stop) {
-            return Vec::new();
+            return endpoints;
         }
     }
-    parse_guid(pair_out).into_iter().collect()
+
+    // 2) scan the paired IP for the connect port (mDNS is unreliable on hotspots)
+    if let Some((ip, pair_port)) = split_host_port(pair_host) {
+        let lo: u32 = 30000;
+        let hi: u32 = 50000;
+        let open = scan_open_ports(&ip, lo..hi, pair_port as u32, stop);
+        for p in open {
+            push(format!("{ip}:{p}"), &mut endpoints, &mut seen);
+        }
+    }
+
+    // 3) last resort: the device guid printed by `adb pair`
+    if let Some(guid) = parse_guid(pair_out) {
+        push(guid, &mut endpoints, &mut seen);
+    }
+
+    endpoints
 }
 
 fn parse_guid(out: &str) -> Option<String> {
