@@ -1525,17 +1525,12 @@ impl App {
                     .max_height(height)
                     .show(ui, |ui| {
                         ui.set_min_height(height);
-                        // read-only multiline TextEdit so the log can be
-                        // selected and copied with Ctrl+C
-                        let text = self.logs.join("\n");
-                        let mut text = text;
-                        egui::TextEdit::multiline(&mut text)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(20)
-                            .interactive(true)
-                            .show(ui);
-                        ui.allocate_space(egui::vec2(0.0, height));
+                        // selectable so lines can be highlighted and copied
+                        for line in &self.logs {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(line).monospace().color(egui::Color32::LIGHT_GRAY),
+                            ).selectable(true));
+                        }
                     });
             });
     }
