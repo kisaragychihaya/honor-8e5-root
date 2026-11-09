@@ -30,7 +30,7 @@ use qrcode::Color as QrColor;
 use qrcode::QrCode;
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-const APP_TITLE: &str = "荣耀 8E5 / AN00 一键 Root 工具";
+const APP_TITLE: &str = "荣耀 8E5 / 8E6 一键 Root 工具";
 
 const SERVICE_NAME: &str = "debug";
 const PAIR_SERVICE: &str = "_adb-tls-pairing._tcp";
@@ -699,7 +699,7 @@ enum JobKind {
 impl JobKind {
     fn title(self) -> &'static str {
         match self {
-            JobKind::Root => "获取 Root（98260 提权 + KernelSU，自动识别 8E5 / AN00）",
+            JobKind::Root => "获取 Root（98260 提权 + KernelSU，自动识别 8E5 / 8E6）",
             JobKind::DisableOta => "禁用 OTA 更新器",
             JobKind::EnableOta => "启用 OTA 更新器",
         }
@@ -1400,7 +1400,7 @@ impl App {
         };
 
         ui.vertical_centered(|ui| {
-            if button(ui, "获取 Root（98260 提权 + KernelSU，自动识别 8E5 / AN00）") {
+            if button(ui, "获取 Root（98260 提权 + KernelSU，自动识别 8E5 / 8E6）") {
                 self.start_job(JobKind::Root);
             }
             ui.add_space(6.0);
