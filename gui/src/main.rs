@@ -452,10 +452,6 @@ fn mdns_addrs(adb: &Adb, service_type: &str, prefer_instance: &str) -> Vec<Strin
     preferred
 }
 
-fn mdns_addr(adb: &Adb, service_type: &str, prefer_instance: &str) -> Option<String> {
-    mdns_addrs(adb, service_type, prefer_instance).into_iter().next()
-}
-
 fn looks_like_addr(token: &str) -> bool {
     match token.rsplit_once(':') {
         Some((host, port)) => {
@@ -542,44 +538,68 @@ fn pair_loop(adb: &Adb, code: &str, stop: &AtomicBool, tx: &mpsc::Sender<Event>)
         }
         attempt += 1;
 
-        let host =
-            mdns_addr(adb, PAIR_SERVICE, SERVICE_NAME).unwrap_or_else(|| SERVICE_NAME.to_string());
+        // The phone may advertise the pairing service on several NICs (e.g. a
+        // hotspot plus the real WiFi), so rotate through every discovered
+        // address instead of pinning to the first one, which can be unreachable.
+        let hosts = mdns_addrs(adb, PAIR_SERVICE, SERVICE_NAME);
+        let hosts: Vec<String> = if hosts.is_empty() {
+            vec![SERVICE_NAME.to_string()]
+        } else {
+            hosts
+        };
         let _ = tx.send(Event::Status(format!(
-            "第 {attempt}/{PAIR_ATTEMPTS} 次尝试配对（{host}）…"
+            "第 {attempt}/{PAIR_ATTEMPTS} 次尝试配对（{} 个地址）…",
+            hosts.len()
         )));
-        log(tx, &format!("[配对] 第 {attempt} 次：adb pair {host} {code}"));
 
-        match adb.run_interruptible(&["pair", &host, code], stop, PAIR_ATTEMPT_TIMEOUT) {
-            Some(out) => {
-                // before the phone shows its pairing dialog every attempt fails
-                // with the same message; print it once instead of 60 times
-                if out.trim() != last_out.trim() {
-                    for line in out.lines() {
-                        if !line.trim().is_empty() {
-                            log(tx, &format!("   {line}"));
+        let mut paired = false;
+        let mut pair_out = String::new();
+        for host in &hosts {
+            if stop.load(Ordering::SeqCst) {
+                return None;
+            }
+            log(tx, &format!("[配对] 第 {attempt} 次：adb pair {host} {code}"));
+            match adb.run_interruptible(&["pair", host, code], stop, PAIR_ATTEMPT_TIMEOUT) {
+                Some(out) => {
+                    if out.trim() != last_out.trim() {
+                        for line in out.lines() {
+                            if !line.trim().is_empty() {
+                                log(tx, &format!("   {line}"));
+                            }
                         }
+                        last_out = out.clone();
                     }
-                    last_out = out.clone();
-                }
-                if out.contains("Successfully paired") {
-                    log(tx, "[配对] 配对成功，正在建立连接…");
-                    let _ = tx.send(Event::Status("配对成功，正在连接设备…".to_string()));
-                    let endpoints = connect_endpoints(adb, &out, stop);
-                    if endpoints.is_empty() {
-                        log(tx, "[配对] 未找到连接端点，重试");
-                    } else if let Some(target) = connect(adb, &endpoints, stop, tx) {
-                        return Some(target);
-                    } else {
-                        log(tx, "[配对] 连接未确认，重试");
+                    if out.contains("Successfully paired") {
+                        paired = true;
+                        pair_out = out;
+                        break;
                     }
                 }
-            }
-            None => {
-                if stop.load(Ordering::SeqCst) {
-                    return None;
+                None => {
+                    if stop.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    log(tx, &format!("   {host} 无响应，试下一个地址"));
                 }
-                log(tx, "[配对] adb pair 没有响应，重试");
             }
+        }
+
+        if !paired {
+            if !sleep_interruptible(PAIR_INTERVAL, stop) {
+                return None;
+            }
+            continue;
+        }
+
+        log(tx, "[配对] 配对成功，正在建立连接…");
+        let _ = tx.send(Event::Status("配对成功，正在连接设备…".to_string()));
+        let endpoints = connect_endpoints(adb, &pair_out, stop);
+        if endpoints.is_empty() {
+            log(tx, "[配对] 未找到连接端点，重试");
+        } else if let Some(target) = connect(adb, &endpoints, stop, tx) {
+            return Some(target);
+        } else {
+            log(tx, "[配对] 连接未确认，重试");
         }
 
         if !sleep_interruptible(PAIR_INTERVAL, stop) {
