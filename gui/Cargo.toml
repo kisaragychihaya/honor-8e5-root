@@ -1,0 +1,16 @@
+[package]
+name = "hnubl"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+qrcode = "0.14"
+windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = "z"
