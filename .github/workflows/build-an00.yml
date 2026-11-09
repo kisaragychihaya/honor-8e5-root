@@ -1,0 +1,33 @@
+name: build-an00-exploit
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/build-an00.yml']
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: sganggs/CVE-2026-98260-BRM-AN00
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: build aarch64-linux-musl binaries
+        shell: bash
+        run: |
+          set -e
+          cd plant
+          zig cc -target aarch64-linux-musl -O2 -static -o uaf_plant_replay uaf_plant.c pc98260_rootd.c
+          zig cc -target aarch64-linux-musl -O2 -static -o slide_probe slide_probe.c
+          zig cc -target aarch64-linux-musl -O2 -static -o pc98260-su pc98260_su.c
+          zig cc -target aarch64-linux-musl -O2 -static -o cap_check cap_check.c
+      - uses: actions/upload-artifact@v4
+        with:
+          name: an00-exploit
+          path: |
+            plant/uaf_plant_replay
+            plant/slide_probe
+            plant/pc98260-su
+            plant/cap_check

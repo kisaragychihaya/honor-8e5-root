@@ -1,10 +1,12 @@
-//! hnubl - Honor BKQ-AN90 one-click root / KernelSU / OTA tool, single-file GUI.
+//! hnubl - Honor 8E5 (BKQ-AN90) / AN00 (BRM-AN00) one-click root / KernelSU / OTA tool, single-file GUI.
 //!
 //! Replaces main.bat + reroot.bat + adb_connect.bat + adbpair.exe:
 //!   * finds adb next to the exe, uses an already connected device when there is one
 //!   * otherwise shows a QR code for wireless adb pairing and polls `adb pair` in a
 //!     background thread until the phone scans it
 //!   * menu: get root (CVE-2026-98260 + KernelSU), disable / enable the OTA updater
+//!   * root backend selected by kernel: 8E5 uses magic-98260 + reroot.sh,
+//!     AN00 uses brm-an00 + reroot-an00.sh with KernelSU 3.3.1 late-load
 //!   * every adb command streams its output into an egui log view
 //!
 //! All adb children are spawned with `ADB_MDNS_OPENSCREEN=1` so mDNS discovery works
@@ -28,7 +30,7 @@ use qrcode::Color as QrColor;
 use qrcode::QrCode;
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-const APP_TITLE: &str = "荣耀 8E5 机型一键 Root 工具";
+const APP_TITLE: &str = "荣耀 8E5 / AN00 一键 Root 工具";
 
 const SERVICE_NAME: &str = "debug";
 const PAIR_SERVICE: &str = "_adb-tls-pairing._tcp";
@@ -697,7 +699,7 @@ enum JobKind {
 impl JobKind {
     fn title(self) -> &'static str {
         match self {
-            JobKind::Root => "获取 Root（98260 提权 + KernelSU）",
+            JobKind::Root => "获取 Root（98260 提权 + KernelSU，自动识别 8E5 / AN00）",
             JobKind::DisableOta => "禁用 OTA 更新器",
             JobKind::EnableOta => "启用 OTA 更新器",
         }
@@ -716,12 +718,84 @@ fn require_file(path: &Path, what: &str) -> Result<(), String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Profile {
+    E8E5,
+    An00,
+    Unsupported,
+}
+
+fn detect_profile(adb: &Adb) -> Profile {
+    let uname = adb.run(&["shell", "uname -r"]).unwrap_or_default();
+    let model = adb
+        .run(&["shell", "getprop ro.product.model"])
+        .unwrap_or_default();
+    log_uname_model(&uname, &model);
+    if uname.contains("6.18.21-android17") {
+        return Profile::An00;
+    }
+    if uname.contains("6.12.58-android16") || model.contains("BKQ") {
+        return Profile::E8E5;
+    }
+    Profile::Unsupported
+}
+
+fn log_uname_model(uname: &str, model: &str) {
+    let mut lines = String::new();
+    for (label, value) in [("uname", uname), ("model", model)] {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if !lines.is_empty() {
+            lines.push('\n');
+        }
+        for line in value.lines() {
+            lines.push_str(label);
+            lines.push_str(": ");
+            lines.push_str(line);
+            lines.push('\n');
+        }
+    }
+    if !lines.is_empty() {
+        eprint!("{lines}");
+    }
+}
+
+fn describe_profile(profile: Profile) -> &'static str {
+    match profile {
+        Profile::E8E5 => "8E5",
+        Profile::An00 => "AN00",
+        Profile::Unsupported => "未知",
+    }
+}
+
 fn job_root(
     adb: &Adb,
     stop: &AtomicBool,
     tx: &mpsc::Sender<Event>,
 ) -> Result<(), String> {
-    log(tx, "== [1/6] 检查设备 ==");
+    let profile = detect_profile(adb);
+    log(
+        tx,
+        &format!("== 检测机型：{} ==", describe_profile(profile)),
+    );
+    match profile {
+        Profile::E8E5 => job_root_e8e5(adb, stop, tx),
+        Profile::An00 => job_root_an00(adb, stop, tx),
+        Profile::Unsupported => {
+            let uname = adb.run(&["shell", "uname -r"]).unwrap_or_default();
+            Err(format!("不支持的内核/机型：`{}`", uname.trim()))
+        }
+    }
+}
+
+fn job_root_e8e5(
+    adb: &Adb,
+    stop: &AtomicBool,
+    tx: &mpsc::Sender<Event>,
+) -> Result<(), String> {
+    log(tx, "== 8E5 [1/6] 检查设备 ==");
     let devices = list_devices(adb);
     let device = devices
         .iter()
@@ -734,7 +808,7 @@ fn job_root(
         }
     }
 
-    log(tx, "== [2/6] 检查 KernelSU 管理器 ==");
+    log(tx, "== 8E5 [2/6] 检查 KernelSU 管理器 ==");
     let pm_path = adb
         .run(&["shell", "pm path me.weishu.kernelsu"])
         .unwrap_or_default();
@@ -749,7 +823,7 @@ fn job_root(
         log(tx, "   管理器安装完成");
     }
 
-    log(tx, "== [3/6] 推送提权资产 ==");
+    log(tx, "== 8E5 [3/6] 推送提权资产 ==");
     let assets = adb.base.join("assets").join("magic-98260");
     require_file(&assets, "提权资产目录")?;
     let assets = assets.to_string_lossy().into_owned();
@@ -762,7 +836,7 @@ fn job_root(
         PUSH_TIMEOUT,
     )?;
 
-    log(tx, "== [4/6] 推送 reroot.sh ==");
+    log(tx, "== 8E5 [4/6] 推送 reroot.sh ==");
     let script = adb.base.join("assets").join("reroot.sh");
     require_file(&script, "reroot.sh")?;
     let script = script.to_string_lossy().into_owned();
@@ -779,7 +853,7 @@ fn job_root(
         PUSH_TIMEOUT,
     )?;
 
-    log(tx, "== [5/6] 执行 98260 提权链 + 加载 KernelSU 模块（约 1~5 分钟）==");
+    log(tx, "== 8E5 [5/6] 执行 98260 提权链 + 加载 KernelSU 模块（约 1~5 分钟）==");
     adb.stream(
         &["shell", "sh /data/local/tmp/reroot.sh"],
         stop,
@@ -787,7 +861,108 @@ fn job_root(
         EXPLOIT_TIMEOUT,
     )?;
 
-    log(tx, "== [6/6] 完成，请在手机上打开 KernelSU 管理器确认状态 ==");
+    log(tx, "== 8E5 [6/6] 完成，请在手机上打开 KernelSU 管理器确认状态 ==");
+    Ok(())
+}
+
+fn job_root_an00(
+    adb: &Adb,
+    stop: &AtomicBool,
+    tx: &mpsc::Sender<Event>,
+) -> Result<(), String> {
+    log(tx, "== AN00 [1/5] 推送 exploit ==");
+    let assets = adb.base.join("assets").join("brm-an00");
+    for name in [
+        "uaf_plant_replay",
+        "slide_probe",
+        "pc98260-su",
+        "cap_check",
+    ] {
+        if !assets.join(name).is_file() {
+            return Err(format!(
+                "缺少 {name}；请先跑 GitHub Actions 下载 exploit 放进 assets/brm-an00/"
+            ));
+        }
+    }
+    let ksud = adb.base.join("assets").join("magic-98260").join("ksud");
+    require_file(&ksud, "KernelSU ksud")?;
+    let apk = adb.base.join("assets").join("ksu.apk");
+    require_file(&apk, "KernelSU 安装包")?;
+    let script = adb.base.join("assets").join("reroot-an00.sh");
+    require_file(&script, "reroot-an00.sh")?;
+
+    let assets_path = assets.to_string_lossy().into_owned();
+    adb.run(&["shell", "rm -rf /data/local/tmp/brm-an00"]);
+    adb.stream(
+        &["push", &assets_path, "/data/local/tmp/brm-an00"],
+        stop,
+        tx,
+        PUSH_TIMEOUT,
+    )?;
+    adb.stream(
+        &["shell", "chmod -R 755 /data/local/tmp/brm-an00"],
+        stop,
+        tx,
+        PUSH_TIMEOUT,
+    )?;
+
+    log(tx, "== AN00 [2/5] 推送 KernelSU 资产 ==");
+    let ksud = ksud.to_string_lossy().into_owned();
+    adb.stream(
+        &["push", &ksud, "/data/local/tmp/brm-an00/ksud"],
+        stop,
+        tx,
+        PUSH_TIMEOUT,
+    )?;
+    let apk = apk.to_string_lossy().into_owned();
+    adb.stream(
+        &["push", &apk, "/data/local/tmp/brm-an00/ksu.apk"],
+        stop,
+        tx,
+        PUSH_TIMEOUT,
+    )?;
+    adb.stream(
+        &["shell", "chmod 755 /data/local/tmp/brm-an00/ksud"],
+        stop,
+        tx,
+        PUSH_TIMEOUT,
+    )?;
+
+    log(tx, "== AN00 [3/5] 检查 KernelSU 管理器 ==");
+    let pm_path = adb
+        .run(&["shell", "pm path me.weishu.kernelsu"])
+        .unwrap_or_default();
+    if pm_path.contains("base.apk") {
+        log(tx, "   管理器已安装，跳过");
+    } else {
+        log(tx, "   未安装，正在安装 KernelSU v3.3.1 …");
+        adb.stream(&["install", "-r", &apk], stop, tx, INSTALL_TIMEOUT)?;
+        log(tx, "   管理器安装完成");
+    }
+
+    log(tx, "== AN00 [4/5] 推送 reroot-an00.sh ==");
+    let script = script.to_string_lossy().into_owned();
+    adb.stream(
+        &["push", &script, "/data/local/tmp/reroot-an00.sh"],
+        stop,
+        tx,
+        PUSH_TIMEOUT,
+    )?;
+    adb.stream(
+        &["shell", "chmod 755 /data/local/tmp/reroot-an00.sh"],
+        stop,
+        tx,
+        PUSH_TIMEOUT,
+    )?;
+
+    log(tx, "== AN00 [5/5] 执行 98260 exploit + KernelSU late-load（约 1~5 分钟）==");
+    adb.stream(
+        &["shell", "sh /data/local/tmp/reroot-an00.sh"],
+        stop,
+        tx,
+        EXPLOIT_TIMEOUT,
+    )?;
+    log(tx, "== AN00 完成，请在手机上打开 KernelSU 管理器确认状态 ==");
     Ok(())
 }
 
@@ -1186,7 +1361,7 @@ impl App {
     fn menu_page(&mut self, ui: &mut egui::Ui) {
         let serial = self.serial.clone().unwrap_or_default();
         ui.horizontal(|ui| {
-            ui.heading("荣耀 8E5 机型一键 Root 工具");
+            ui.heading(APP_TITLE);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("退出").clicked() {
                     self.shutdown();
@@ -1225,7 +1400,7 @@ impl App {
         };
 
         ui.vertical_centered(|ui| {
-            if button(ui, "获取 Root（98260 提权 + KernelSU）") {
+            if button(ui, "获取 Root（98260 提权 + KernelSU，自动识别 8E5 / AN00）") {
                 self.start_job(JobKind::Root);
             }
             ui.add_space(6.0);
